@@ -58,7 +58,6 @@ def load_data():
         for future in as_completed(futures):
             records.extend(future.result()["orders"])
 
-    # Deduplicate order IDs, retaining the latest updated version.
     latest = {}
     for order in records:
         order_id = order["id"]
@@ -147,24 +146,38 @@ def apply_filters(orders, predicates):
 
 @mcp.tool()
 def answer_question(question: str) -> dict:
-    """Answer plain-English questions about Acme Appliances orders.
-    Handles revenue, average paid order value, refunds, counts,
-    products, quantities and customers. Monetary answers are in USD."""
+    """Answer plain-English questions about orders, revenue, refunds,
+    average paid order value, distinct customers, products and quantities.
+    Monetary answers are in USD."""
     try:
         load_data()
         q = question.lower()
         selected = apply_filters(_orders, filters(question))
 
+        # Refund questions
         if "refund" in q or "refunded" in q:
-            refunded = [o for o in selected if o["status"] == "refunded"]
+            refunded = [
+                o for o in selected if o["status"] == "refunded"
+            ]
             if any(w in q for w in ["how many", "number of", "count"]):
                 return {"answer": len(refunded)}
             return {
-                "answer": round(sum(amount_usd(o) for o in refunded), 2)
+                "answer": round(
+                    sum(amount_usd(o) for o in refunded), 2
+                )
             }
 
+        # Only paid orders for paid-order questions
+        paid = [o for o in selected if o["status"] == "paid"]
+
+        # Distinct customer count
+        if "distinct customer" in q or "unique customer" in q:
+            return {
+                "answer": len({o["customer"] for o in paid})
+            }
+
+        # Average paid order value
         if any(w in q for w in ["average", "avg", "mean"]):
-            paid = [o for o in selected if o["status"] == "paid"]
             if not paid:
                 return {"answer": 0}
             return {
@@ -173,11 +186,13 @@ def answer_question(question: str) -> dict:
                 )
             }
 
+        # Count questions
         if any(w in q for w in ["how many", "number of", "count"]):
+            if "paid" in q or "bought" in q or "purchased" in q:
+                return {"answer": len(paid)}
             return {"answer": len(selected)}
 
-        paid = [o for o in selected if o["status"] == "paid"]
-
+        # Product with highest paid revenue
         if any(w in q for w in [
             "which product", "top product", "best-selling product",
             "most revenue", "earned the most"
@@ -185,18 +200,23 @@ def answer_question(question: str) -> dict:
             totals = {}
             for o in paid:
                 product = o["product"]
-                totals[product] = totals.get(product, 0) + amount_usd(o)
+                totals[product] = (
+                    totals.get(product, 0) + amount_usd(o)
+                )
             if not totals:
                 return {"answer": "No matching paid orders"}
             return {"answer": max(totals, key=totals.get)}
 
+        # Customer with highest paid revenue
         if any(w in q for w in [
             "which customer", "top customer", "best customer"
         ]):
             totals = {}
             for o in paid:
                 customer = o["customer"]
-                totals[customer] = totals.get(customer, 0) + amount_usd(o)
+                totals[customer] = (
+                    totals.get(customer, 0) + amount_usd(o)
+                )
             if not totals:
                 return {"answer": "No matching paid orders"}
             return {"answer": max(totals, key=totals.get)}
@@ -206,6 +226,7 @@ def answer_question(question: str) -> dict:
         ]):
             return {"answer": sum(o["qty"] for o in paid)}
 
+        # Default: total paid revenue
         return {
             "answer": round(sum(amount_usd(o) for o in paid), 2)
         }
@@ -214,4 +235,41 @@ def answer_question(question: str) -> dict:
         return {"answer": "Unable to retrieve or process ledger data."}
 
 
-app = mcp.streamable_http_app()
+class AcceptHeaderFix:
+    def __init__(self, application):
+        self.application = application
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope["type"] == "http"
+            and scope.get("path", "").rstrip("/") == "/mcp"
+        ):
+            scope = dict(scope)
+            headers = list(scope.get("headers", []))
+            updated = []
+            found = False
+
+            for key, value in headers:
+                if key.lower() == b"accept":
+                    accept = value.decode("latin-1")
+                    if "application/json" not in accept:
+                        accept += ", application/json"
+                    if "text/event-stream" not in accept:
+                        accept += ", text/event-stream"
+                    updated.append((key, accept.encode("latin-1")))
+                    found = True
+                else:
+                    updated.append((key, value))
+
+            if not found:
+                updated.append((
+                    b"accept",
+                    b"application/json, text/event-stream"
+                ))
+
+            scope["headers"] = updated
+
+        await self.application(scope, receive, send)
+
+
+app = AcceptHeaderFix(mcp.streamable_http_app())
