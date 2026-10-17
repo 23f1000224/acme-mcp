@@ -1,6 +1,7 @@
 
 import os
 import re
+import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
@@ -12,6 +13,9 @@ from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
 from starlette.routing import Mount
 
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 ROOT_URL = os.environ["LEDGER_URL"]
 TZ = ZoneInfo("Asia/Kolkata")
@@ -42,6 +46,13 @@ def page_url(first_url, page):
     )
 
 
+def parse_datetime(value):
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=TZ)
+    return dt
+
+
 def load_data():
     global _orders, _rates
 
@@ -49,9 +60,7 @@ def load_data():
         return
 
     discovery = get_json(ROOT_URL)
-    _rates = get_json(
-        discovery["links"]["rates"]
-    )["usd_per_unit"]
+    _rates = get_json(discovery["links"]["rates"])["usd_per_unit"]
 
     first_url = discovery["links"]["orders"]
     first_page = get_json(first_url)
@@ -59,56 +68,41 @@ def load_data():
     records = list(first_page["orders"])
     pages = int(first_page["pages"])
 
-    urls = [
-        page_url(first_url, page)
-        for page in range(2, pages + 1)
-    ]
+    urls = [page_url(first_url, page) for page in range(2, pages + 1)]
 
     with ThreadPoolExecutor(max_workers=12) as pool:
-        futures = [
-            pool.submit(get_json, url)
-            for url in urls
-        ]
+        futures = [pool.submit(get_json, url) for url in urls]
 
         for future in as_completed(futures):
             records.extend(future.result()["orders"])
 
-    # Keep the latest version of each order.
+    # Keep only the latest version of each order.
     latest = {}
 
     for order in records:
         order_id = order["id"]
-        updated = datetime.fromisoformat(
-            order["updated_at"].replace("Z", "+00:00")
-        )
-
+        updated = parse_datetime(order["updated_at"])
         previous = latest.get(order_id)
 
         if previous is None:
             latest[order_id] = order
-        else:
-            previous_updated = datetime.fromisoformat(
-                previous["updated_at"].replace("Z", "+00:00")
-            )
-
-            if updated > previous_updated:
-                latest[order_id] = order
+        elif updated > parse_datetime(previous["updated_at"]):
+            latest[order_id] = order
 
     _orders = list(latest.values())
+    logger.info("Loaded %s unique orders", len(_orders))
 
 
 def order_date(order):
-    dt = datetime.fromisoformat(
-        order["created_at"].replace("Z", "+00:00")
-    )
-    return dt.astimezone(TZ)
+    return parse_datetime(order["created_at"]).astimezone(TZ)
 
 
 def amount_usd(order):
-    return (
-        float(order["amount"])
-        * float(_rates[order["currency"]])
-    )
+    currency = order["currency"]
+    if currency not in _rates:
+        raise ValueError(f"Missing USD conversion rate for {currency}")
+
+    return float(order["amount"]) * float(_rates[currency])
 
 
 def filters(question):
@@ -136,13 +130,11 @@ def filters(question):
     for product in products:
         if product.lower() in q:
             result.append(
-                lambda o, p=product:
-                o["product"].lower() == p.lower()
+                lambda o, p=product: o["product"].lower() == p.lower()
             )
             break
 
     customer = re.search(r"\bC\d{4}\b", question, re.I)
-
     if customer:
         cid = customer.group().upper()
         result.append(
@@ -167,17 +159,11 @@ def filters(question):
     for name, number in months.items():
         if re.search(r"\b" + name + r"\b", q):
             year_match = re.search(r"\b20\d{2}\b", q)
-            year = (
-                int(year_match.group())
-                if year_match else None
-            )
+            year = int(year_match.group()) if year_match else None
 
             def date_filter(o, n=number, y=year):
                 d = order_date(o)
-                return (
-                    d.month == n
-                    and (y is None or d.year == y)
-                )
+                return d.month == n and (y is None or d.year == y)
 
             result.append(date_filter)
             break
@@ -192,6 +178,33 @@ def apply_filters(orders, predicates):
     ]
 
 
+def is_count_question(q):
+    return any(
+        phrase in q
+        for phrase in ["how many", "number of", "count"]
+    )
+
+
+def is_product_revenue_ranking(q):
+    normalized = q.replace("-", " ")
+
+    ranking_phrases = [
+        "top product",
+        "top selling product",
+        "best selling product",
+        "which product",
+        "most revenue",
+        "earned the most",
+        "highest revenue",
+        "highest earning product",
+        "product by revenue",
+        "revenue by product",
+        "sold the most",
+    ]
+
+    return any(phrase in normalized for phrase in ranking_phrases)
+
+
 @mcp.tool()
 def answer_question(question: str) -> dict:
     """Answer questions about orders, revenue, refunds,
@@ -202,9 +215,7 @@ def answer_question(question: str) -> dict:
         load_data()
         q = question.lower()
 
-        selected = apply_filters(
-            _orders, filters(question)
-        )
+        selected = apply_filters(_orders, filters(question))
 
         # Refund questions
         if "refund" in q or "refunded" in q:
@@ -213,10 +224,7 @@ def answer_question(question: str) -> dict:
                 if o["status"].lower() == "refunded"
             ]
 
-            if any(
-                word in q
-                for word in ["how many", "number of", "count"]
-            ):
+            if is_count_question(q):
                 return {"answer": len(refunded)}
 
             return {
@@ -225,43 +233,79 @@ def answer_question(question: str) -> dict:
                 )
             }
 
-        # Paid orders only
+        # Paid orders only for sales and revenue questions
         paid = [
             o for o in selected
             if o["status"].lower() == "paid"
         ]
 
         # Distinct customers
-        if (
-            "distinct customer" in q
-            or "unique customer" in q
-        ):
+        if "distinct customer" in q or "unique customer" in q:
             return {
-                "answer": len({
-                    o["customer"] for o in paid
-                })
+                "answer": len({o["customer"] for o in paid})
             }
 
-        # Average paid order value
+        # Product with the highest total paid revenue.
+        # This handles "top-selling product by revenue",
+        # "top selling product", and similar questions.
+        if is_product_revenue_ranking(q):
+            totals = {}
+
+            for order in paid:
+                product = order["product"]
+                totals[product] = (
+                    totals.get(product, 0.0) + amount_usd(order)
+                )
+
+            if not totals:
+                return {"answer": "No matching paid orders"}
+
+            best_product = max(totals, key=totals.get)
+            logger.info(
+                "Product revenue ranking for question %r: %s",
+                question,
+                {k: round(v, 2) for k, v in totals.items()},
+            )
+
+            return {"answer": best_product}
+
+        # Customer with the highest paid revenue
         if any(
-            word in q for word in ["average", "avg", "mean"]
+            phrase in q
+            for phrase in [
+                "which customer",
+                "top customer",
+                "best customer",
+                "highest revenue customer",
+            ]
         ):
+            totals = {}
+
+            for order in paid:
+                customer = order["customer"]
+                totals[customer] = (
+                    totals.get(customer, 0.0) + amount_usd(order)
+                )
+
+            if not totals:
+                return {"answer": "No matching paid orders"}
+
+            return {"answer": max(totals, key=totals.get)}
+
+        # Average paid order value
+        if any(word in q for word in ["average", "avg", "mean"]):
             if not paid:
                 return {"answer": 0}
 
             return {
                 "answer": round(
-                    sum(amount_usd(o) for o in paid)
-                    / len(paid),
+                    sum(amount_usd(o) for o in paid) / len(paid),
                     2,
                 )
             }
 
         # Count questions
-        if any(
-            word in q
-            for word in ["how many", "number of", "count"]
-        ):
+        if is_count_question(q):
             if any(
                 word in q
                 for word in ["paid", "bought", "purchased"]
@@ -270,76 +314,14 @@ def answer_question(question: str) -> dict:
 
             return {"answer": len(selected)}
 
-        # Product with highest paid revenue
-        if any(
-            phrase in q
-            for phrase in [
-                "which product",
-                "top product",
-                "best-selling product",
-                "most revenue",
-                "earned the most",
-            ]
-        ):
-            totals = {}
-
-            for order in paid:
-                product = order["product"]
-                totals[product] = (
-                    totals.get(product, 0)
-                    + amount_usd(order)
-                )
-
-            if not totals:
-                return {
-                    "answer": "No matching paid orders"
-                }
-
-            return {
-                "answer": max(totals, key=totals.get)
-            }
-
-        # Customer with highest paid revenue
-        if any(
-            phrase in q
-            for phrase in [
-                "which customer",
-                "top customer",
-                "best customer",
-            ]
-        ):
-            totals = {}
-
-            for order in paid:
-                customer = order["customer"]
-                totals[customer] = (
-                    totals.get(customer, 0)
-                    + amount_usd(order)
-                )
-
-            if not totals:
-                return {
-                    "answer": "No matching paid orders"
-                }
-
-            return {
-                "answer": max(totals, key=totals.get)
-            }
-
         # Units sold
         if any(
             phrase in q
-            for phrase in [
-                "quantity",
-                "units sold",
-                "how many units",
-            ]
+            for phrase in ["quantity", "units sold", "how many units"]
         ):
-            return {
-                "answer": sum(o["qty"] for o in paid)
-            }
+            return {"answer": sum(o["qty"] for o in paid)}
 
-        # Default: total paid revenue
+        # Default: total paid revenue in USD
         return {
             "answer": round(
                 sum(amount_usd(o) for o in paid), 2
@@ -347,6 +329,7 @@ def answer_question(question: str) -> dict:
         }
 
     except Exception:
+        logger.exception("Failed to answer question: %s", question)
         return {
             "answer": "Unable to retrieve or process ledger data."
         }
@@ -408,9 +391,7 @@ class AcceptHeaderFix:
 
 app = AcceptHeaderFix(
     Starlette(
-        routes=[
-            Mount("/mcp", app=mcp_app),
-        ],
+        routes=[Mount("/mcp", app=mcp_app)],
         lifespan=lifespan,
     )
 )
