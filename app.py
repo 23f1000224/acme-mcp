@@ -11,7 +11,8 @@ from contextlib import asynccontextmanager
 import requests
 from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
-from starlette.routing import Mount
+from starlette.responses import JSONResponse
+from starlette.routing import Mount, Route
 
 
 logging.basicConfig(level=logging.INFO)
@@ -59,8 +60,12 @@ def load_data():
     if _orders is not None:
         return
 
+    logger.info("Loading ledger data")
     discovery = get_json(ROOT_URL)
-    _rates = get_json(discovery["links"]["rates"])["usd_per_unit"]
+
+    _rates = get_json(
+        discovery["links"]["rates"]
+    )["usd_per_unit"]
 
     first_url = discovery["links"]["orders"]
     first_page = get_json(first_url)
@@ -68,7 +73,10 @@ def load_data():
     records = list(first_page["orders"])
     pages = int(first_page["pages"])
 
-    urls = [page_url(first_url, page) for page in range(2, pages + 1)]
+    urls = [
+        page_url(first_url, page)
+        for page in range(2, pages + 1)
+    ]
 
     with ThreadPoolExecutor(max_workers=12) as pool:
         futures = [pool.submit(get_json, url) for url in urls]
@@ -76,7 +84,7 @@ def load_data():
         for future in as_completed(futures):
             records.extend(future.result()["orders"])
 
-    # Keep only the latest version of each order.
+    # Retain the latest version of every order.
     latest = {}
 
     for order in records:
@@ -90,7 +98,7 @@ def load_data():
             latest[order_id] = order
 
     _orders = list(latest.values())
-    logger.info("Loaded %s unique orders", len(_orders))
+    logger.info("Loaded %d unique orders", len(_orders))
 
 
 def order_date(order):
@@ -99,6 +107,7 @@ def order_date(order):
 
 def amount_usd(order):
     currency = order["currency"]
+
     if currency not in _rates:
         raise ValueError(f"Missing USD conversion rate for {currency}")
 
@@ -109,6 +118,7 @@ def filters(question):
     q = question.lower()
     result = []
 
+    # Region
     for region in ["north", "south", "east", "west", "central"]:
         if re.search(r"\b" + region + r"\b", q):
             result.append(
@@ -116,6 +126,7 @@ def filters(question):
             )
             break
 
+    # Product
     products = [
         "Air Fryer",
         "Rice Cooker",
@@ -134,13 +145,16 @@ def filters(question):
             )
             break
 
+    # Customer ID
     customer = re.search(r"\bC\d{4}\b", question, re.I)
+
     if customer:
         cid = customer.group().upper()
         result.append(
             lambda o, c=cid: o["customer"].upper() == c
         )
 
+    # Month and optional year
     months = {
         "january": 1,
         "february": 2,
@@ -188,7 +202,7 @@ def is_count_question(q):
 def is_product_revenue_ranking(q):
     normalized = q.replace("-", " ")
 
-    ranking_phrases = [
+    phrases = [
         "top product",
         "top selling product",
         "best selling product",
@@ -200,9 +214,25 @@ def is_product_revenue_ranking(q):
         "product by revenue",
         "revenue by product",
         "sold the most",
+        "top selling",
+        "best selling",
     ]
 
-    return any(phrase in normalized for phrase in ranking_phrases)
+    return any(phrase in normalized for phrase in phrases)
+
+
+def is_customer_revenue_ranking(q):
+    return any(
+        phrase in q
+        for phrase in [
+            "which customer",
+            "top customer",
+            "best customer",
+            "highest revenue customer",
+            "customer who spent the most",
+            "customer with the most revenue",
+        ]
+    )
 
 
 @mcp.tool()
@@ -233,21 +263,23 @@ def answer_question(question: str) -> dict:
                 )
             }
 
-        # Paid orders only for sales and revenue questions
+        # Only paid orders count as sales.
         paid = [
             o for o in selected
             if o["status"].lower() == "paid"
         ]
 
-        # Distinct customers
-        if "distinct customer" in q or "unique customer" in q:
+        # Distinct customers who bought products.
+        if (
+            "distinct customer" in q
+            or "unique customer" in q
+            or "different customers" in q
+        ):
             return {
                 "answer": len({o["customer"] for o in paid})
             }
 
         # Product with the highest total paid revenue.
-        # This handles "top-selling product by revenue",
-        # "top selling product", and similar questions.
         if is_product_revenue_ranking(q):
             totals = {}
 
@@ -260,25 +292,12 @@ def answer_question(question: str) -> dict:
             if not totals:
                 return {"answer": "No matching paid orders"}
 
-            best_product = max(totals, key=totals.get)
-            logger.info(
-                "Product revenue ranking for question %r: %s",
-                question,
-                {k: round(v, 2) for k, v in totals.items()},
-            )
+            return {
+                "answer": max(totals, key=totals.get)
+            }
 
-            return {"answer": best_product}
-
-        # Customer with the highest paid revenue
-        if any(
-            phrase in q
-            for phrase in [
-                "which customer",
-                "top customer",
-                "best customer",
-                "highest revenue customer",
-            ]
-        ):
+        # Customer with the highest total paid revenue.
+        if is_customer_revenue_ranking(q):
             totals = {}
 
             for order in paid:
@@ -290,21 +309,36 @@ def answer_question(question: str) -> dict:
             if not totals:
                 return {"answer": "No matching paid orders"}
 
-            return {"answer": max(totals, key=totals.get)}
+            return {
+                "answer": max(totals, key=totals.get)
+            }
 
-        # Average paid order value
+        # Average paid order value, including region/month filters.
         if any(word in q for word in ["average", "avg", "mean"]):
             if not paid:
                 return {"answer": 0}
 
+            average = (
+                sum(amount_usd(o) for o in paid) / len(paid)
+            )
+
+            return {"answer": round(average, 2)}
+
+        # Units sold.
+        if any(
+            phrase in q
+            for phrase in [
+                "quantity",
+                "units sold",
+                "how many units",
+                "number of units",
+            ]
+        ):
             return {
-                "answer": round(
-                    sum(amount_usd(o) for o in paid) / len(paid),
-                    2,
-                )
+                "answer": sum(int(o["qty"]) for o in paid)
             }
 
-        # Count questions
+        # Count orders.
         if is_count_question(q):
             if any(
                 word in q
@@ -314,14 +348,7 @@ def answer_question(question: str) -> dict:
 
             return {"answer": len(selected)}
 
-        # Units sold
-        if any(
-            phrase in q
-            for phrase in ["quantity", "units sold", "how many units"]
-        ):
-            return {"answer": sum(o["qty"] for o in paid)}
-
-        # Default: total paid revenue in USD
+        # Total paid revenue in USD.
         return {
             "answer": round(
                 sum(amount_usd(o) for o in paid), 2
@@ -335,6 +362,35 @@ def answer_question(question: str) -> dict:
         }
 
 
+async def plain_answer(request):
+    try:
+        data = await request.json()
+
+        if not isinstance(data, dict):
+            return JSONResponse(
+                {"error": "Request body must be a JSON object"},
+                status_code=400,
+            )
+
+        question = data.get("question")
+
+        if not isinstance(question, str) or not question.strip():
+            return JSONResponse(
+                {"error": "Expected a non-empty question string"},
+                status_code=400,
+            )
+
+        result = answer_question(question)
+        return JSONResponse(result)
+
+    except Exception:
+        logger.exception("HTTP request failed")
+        return JSONResponse(
+            {"error": "Unable to process request"},
+            status_code=500,
+        )
+
+
 @asynccontextmanager
 async def lifespan(app):
     async with mcp.session_manager.run():
@@ -343,55 +399,12 @@ async def lifespan(app):
 
 mcp_app = mcp.streamable_http_app()
 
-
-class AcceptHeaderFix:
-    """Ensure the MCP transport receives required Accept types."""
-
-    def __init__(self, application):
-        self.application = application
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] == "http":
-            path = scope.get("path", "").rstrip("/")
-
-            if path == "/mcp":
-                scope = dict(scope)
-                headers = list(scope.get("headers", []))
-                updated = []
-                found = False
-
-                for key, value in headers:
-                    if key.lower() == b"accept":
-                        accept = value.decode("latin-1")
-                        lower_accept = accept.lower()
-
-                        if "application/json" not in lower_accept:
-                            accept += ", application/json"
-
-                        if "text/event-stream" not in lower_accept:
-                            accept += ", text/event-stream"
-
-                        updated.append(
-                            (key, accept.encode("latin-1"))
-                        )
-                        found = True
-                    else:
-                        updated.append((key, value))
-
-                if not found:
-                    updated.append((
-                        b"accept",
-                        b"application/json, text/event-stream",
-                    ))
-
-                scope["headers"] = updated
-
-        await self.application(scope, receive, send)
-
-
-app = AcceptHeaderFix(
-    Starlette(
-        routes=[Mount("/mcp", app=mcp_app)],
-        lifespan=lifespan,
-    )
+app = Starlette(
+    routes=[
+        Route("/", plain_answer, methods=["POST"]),
+        Route("/mcp", plain_answer, methods=["POST"]),
+        Route("/mcp/", plain_answer, methods=["POST"]),
+        Mount("/mcp-rpc", app=mcp_app),
+    ],
+    lifespan=lifespan,
 )
