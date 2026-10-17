@@ -271,7 +271,11 @@ class AcceptHeaderFix:
         await self.application(scope, receive, send)
 
 
-from starlette.middleware import Middleware
+from starlette.applications import Starlette
 from starlette.routing import Mount
 
-app = AcceptHeaderFix(mcp.streamable_http_app())
+mcp_app = mcp.streamable_http_app()
+
+app = Starlette(routes=[
+    Mount("/mcp", app=mcp_app),
+])
