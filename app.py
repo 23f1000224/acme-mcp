@@ -184,4 +184,7 @@ def answer_question(question: str) -> dict:
         return {"answer": "Could not answer the question: " + str(exc)}
 
 
-app = mcp.streamable_http_app()
+app = mcp.streamable_http_app(
+    json_response=True,
+    stateless_http=True
+)
